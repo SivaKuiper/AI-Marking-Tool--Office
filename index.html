@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KEIPL - Smart Marking Tool V10.1</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        *{font-family:'Plus Jakarta Sans',sans-serif}.mono{font-family:'JetBrains Mono',monospace}
+        @media print{.no-print{display:none!important}body{background:#fff;padding:0;margin:0;color:#000}th,td{border:1px solid #ccc!important;padding:3px;font-size:7px!important}.print-photo{width:55px!important;height:40px!important;object-fit:cover;border:.5px solid #ccc;border-radius:3px}}
+        .scan-pulse{animation:sp 2s ease-in-out infinite}@keyframes sp{0%,100%{box-shadow:0 0 0 0 rgba(59,130,246,.4)}50%{box-shadow:0 0 0 15px rgba(59,130,246,0)}}
+        .fade-in{animation:fi .3s ease-out}@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+        input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+        input[type=number]:focus{box-shadow:0 0 0 2px #3b82f6;border-color:#3b82f6!important;background:#eff6ff!important}
+        .thumb{width:48px;height:36px;object-fit:cover;border-radius:4px;border:1px solid rgba(255,255,255,.1);cursor:pointer;transition:.2s}.thumb:hover{transform:scale(1.8);z-index:10;position:relative}
+        .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:999;display:flex;align-items:center;justify-content:center;cursor:zoom-out}
+        .modal-bg img{max-width:92vw;max-height:88vh;border-radius:12px;border:2px solid rgba(255,255,255,.15)}
+    </style>
+</head>
+<body class="bg-white text-slate-900">
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useMemo,useRef}=React;
+const DH={customer:'',container:'',factory:'',destination:'',colour:'',marker:'',supervisor:'',defThick:'2',allowance:'0',reportNo:'',invoiceNo:'',inspectDate:new Date().toISOString().split('T')[0]};
+/* === AI SCANNER === */
+function OCRScanner({onDataExtracted}){
+    const[scanning,setScanning]=useState(false);const[preview,setPreview]=useState(null);const[error,setError]=useState('');const[progress,setProgress]=useState('');
+    const[apiKey,setApiKey]=useState(()=>{try{return localStorage.getItem('keipl_api_key')||''}catch{return''}});const[showKey,setShowKey]=useState(false);
+    const fileRef=useRef(null);const camRef=useRef(null);
+    const saveKey=(k)=>{setApiKey(k);try{localStorage.setItem('keipl_api_key',k)}catch{}};
+    const processImage=async(b64,mtype)=>{
+        setScanning(true);setError('');setProgress('Sending to AI...');
+        try{
+            const h={"Content-Type":"application/json"};
+            if(apiKey){h["x-api-key"]=apiKey;h["anthropic-version"]="2023-06-01";h["anthropic-dangerous-direct-browser-access"]="true"}
+            const prompt=`You are an expert at reading handwritten granite measurement sheets. Every number must be exact.
+
+CRITICAL — COLUMN PAIRING RULES:
+Sheets use PAIRED columns where the SAME serial number appears in TWO adjacent columns:
+- Column A: S.No + Inches measurement (smaller numbers, typically 30-90)
+- Column B: S.No + CMS measurement (larger numbers, typically 100-300)
+
+Common layouts:
+LAYOUT 1 (4 columns): 
+  Col1=[S.No, Inches] Col2=[S.No, CMS] Col3=[S.No, Inches] Col4=[S.No, CMS]
+  Col1 and Col2 share the SAME serial numbers (they are paired).
+  Col3 and Col4 share DIFFERENT serial numbers (they are a second pair).
+  Example: Col1 has sno 51-75 inches, Col2 has sno 51-75 CMS, Col3 has sno 76-100 inches, Col4 has sno 76-100 CMS.
+
+LAYOUT 2 (6 columns):
+  Three pairs: [Inches,CMS], [Inches,CMS], [Inches,CMS]
+
+LAYOUT 3 (2 columns): One pair: [Inches,CMS]
+
+HOW TO PAIR:
+1. First identify ALL column groups by reading the serial numbers
+2. Match columns that share the SAME serial number range
+3. The column with SMALLER values (both dims < 80) = INCHES
+4. The column with LARGER values (any dim > 80) = CMS
+5. PAIR them into one slab entry per serial number
+6. If a sheet has NO CMS columns (only inches + SFT), set l_cm=0, w_cm=0
+
+HANDWRITING VERIFICATION:
+- "7" vs "2" vs "1": 7 has horizontal top bar, 2 has a curve, 1 is straight
+- "3" vs "8": 3 has open curves, 8 is closed
+- "5" vs "6": flat top=5, curved=6
+- "4" vs "9": open top=4, closed=9
+- CROSS-CHECK: CMS_L ≈ Inches_L × 2.54. If ratio is far off, re-read digits.
+- If SFT column exists: verify SFT = (Inches_L × Inches_W) / 144
+
+RULES:
+1. DO NOT STOP EARLY. Read EVERY row. Can be 50-180+ slabs.
+2. Read ALL columns. Do not skip any.
+3. Grade (F/G): include if visible, else grade="".
+4. Look for TOTAL/GRAND TOTAL at bottom.
+5. NEVER create separate slab entries for inches and CMS of the same serial number — they MUST be combined.
+
+Return ONLY valid JSON (no markdown, no backticks):
+{"slabs":[{"sno":51,"grade":"","l_in":84,"w_in":32,"l_cm":225,"w_cm":87}],"sheet_totals":{"count":50,"grand_total_sqf":0},"notes":""}
+
+FINAL CHECK: Each sno should appear exactly ONCE with both inches AND cms values filled.`;
+            const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:h,
+                body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:16000,messages:[{role:"user",content:[
+                    {type:"image",source:{type:"base64",media_type:mtype,data:b64}},
+                    {type:"text",text:prompt}
+                ]}]})});
+            const d=await r.json();if(d.error)throw new Error(d.error.message);setProgress('Processing response...');
+            const txt=d.content.map(i=>i.text||"").join("\n").replace(/```json|```/g,"").trim();
+            let parsed,sheetTotals=null,fmt='both',aiNotes='',repaired=false;
+            try{const full=JSON.parse(txt);if(full.slabs){parsed=full.slabs;sheetTotals=full.sheet_totals||null;fmt=full.format||'both';aiNotes=full.notes||''}else if(Array.isArray(full)){parsed=full}else{parsed=null}}
+            catch(e1){
+                try{const m=txt.match(/\[[\s\S]*\]/s);if(m)parsed=JSON.parse(m[0])}
+                catch(e2){
+                    try{let arr=txt;const ai=arr.indexOf('[');if(ai>=0)arr=arr.substring(ai);
+                        const lb=arr.lastIndexOf('}');if(lb>0){arr=arr.substring(0,lb+1)+']';parsed=JSON.parse(arr);repaired=true}
+                    }catch(e3){
+                        try{const objs=txt.match(/\{[^{}]*?"sno"\s*:\s*\d+[^{}]*?\}/g);
+                            if(objs&&objs.length>0){parsed=objs.map(o=>{try{return JSON.parse(o)}catch{return null}}).filter(Boolean);repaired=true}
+                        }catch(e4){parsed=null}
+                    }
+                }
+            }
+            if(!Array.isArray(parsed)||!parsed.length)throw new Error('Could not parse AI response. Try again or use clearer photo.');
+            /* POST-PROCESS: Merge duplicate sno entries (fix split inches/CMS) */
+            const merged={};
+            parsed.forEach(s=>{
+                const key=s.sno;
+                if(!merged[key]){merged[key]={...s}}
+                else{
+                    /* Merge: take non-zero values from both entries */
+                    const ex=merged[key];
+                    if(!ex.l_in&&s.l_in){ex.l_in=s.l_in;ex.w_in=s.w_in}
+                    if(!ex.l_cm&&s.l_cm){ex.l_cm=s.l_cm;ex.w_cm=s.w_cm}
+                    /* If both have inches, the larger one is probably CMS misclassified */
+                    if(ex.l_in&&s.l_in&&ex.l_cm===0&&s.l_cm===0){
+                        if(s.l_in>ex.l_in){ex.l_cm=s.l_in;ex.w_cm=s.w_in}
+                        else{ex.l_cm=ex.l_in;ex.w_cm=ex.w_in;ex.l_in=s.l_in;ex.w_in=s.w_in}
+                    }
+                    if(!ex.grade&&s.grade)ex.grade=s.grade;
+                }
+            });
+            parsed=Object.values(merged).sort((a,b)=>a.sno-b.sno);
+            let warn='';
+            if(repaired)warn='⚠ Response truncated — recovered '+parsed.length+' slabs. Some may be missing.';
+            if(sheetTotals){
+                if(sheetTotals.count&&parsed.length!==sheetTotals.count)warn+=(warn?' | ':'')+'Sheet='+sheetTotals.count+' vs got '+parsed.length;
+                if(sheetTotals.grand_total_sqf){const calcSqf=parsed.reduce((a,s)=>a+((s.l_in*s.w_in)/144),0);const diff=Math.abs(calcSqf-sheetTotals.grand_total_sqf);
+                    if(diff>2)warn+=(warn?' | ':'')+'SQF diff: Sheet='+sheetTotals.grand_total_sqf+' vs '+calcSqf.toFixed(2);}
+            }
+            setProgress('Found '+parsed.length+' slabs!'+(repaired?' (recovered)':''));
+            if(aiNotes)warn+=(warn?' | ':'')+'AI: '+aiNotes;
+            const rd=parsed.map((it,i)=>({id:Date.now()+i,sno:it.sno||(i+1),grade:(it.grade||'').toUpperCase(),
+                l_in:parseFloat(it.l_in)||0,w_in:parseFloat(it.w_in)||0,
+                l_cm:parseFloat(it.l_cm)||0,w_cm:parseFloat(it.w_cm)||0,
+                status:'pending',edited:false}));
+            onDataExtracted(rd,sheetTotals,warn);setScanning(false);setProgress('');
+        }catch(err){setError(err.message||'Failed');setScanning(false);setProgress('')}
+    };
+    const handleFile=(e)=>{const f=e.target.files?.[0];if(!f)return;const rd=new FileReader();rd.onloadend=()=>{setPreview(rd.result);processImage(rd.result.split(",")[1],f.type||'image/jpeg')};rd.readAsDataURL(f)};
+    return(
+        <div className="bg-slate-50 p-5 rounded-2xl border border-blue-500/20">
+            <div className="flex items-center gap-3 mb-4"><div className="w-9 h-9 bg-blue-600 rounded-xl flex items-center justify-center text-lg">📸</div>
+            <div><h3 className="text-xs font-extrabold uppercase tracking-widest text-blue-300">AI Measurement Scanner</h3><p className="text-[10px] text-slate-600 mt-0.5">Reads BOTH Inches & CMS</p></div></div>
+            <div className="mb-4 bg-slate-100 rounded-xl p-3 border border-slate-300">
+                <div className="flex items-center justify-between mb-2"><label className="text-[9px] font-extrabold text-slate-600 uppercase">API Key</label><div className="flex gap-2"><button onClick={()=>setShowKey(!showKey)} className="text-[9px] text-blue-400 font-bold">{showKey?'Hide':'Show'}</button>{apiKey&&<span className="text-[9px] text-emerald-400 font-bold">✓</span>}</div></div>
+                <input type={showKey?"text":"password"} placeholder="sk-ant-api03-..." className="w-full p-2 rounded-lg bg-slate-50 border border-slate-400 text-xs mono text-slate-700 outline-none" value={apiKey} onChange={e=>saveKey(e.target.value)}/>
+                <p className="text-[8px] text-slate-600 mt-1">🔒 Browser-only storage</p>
+            </div>
+            {!scanning&&!preview&&(<div className="grid grid-cols-2 gap-3">
+                <div><input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFile}/><button onClick={()=>{if(!apiKey){setError('Enter API key first');return}camRef.current?.click()}} className="w-full bg-blue-600 hover:bg-blue-500 p-4 rounded-xl text-center scan-pulse"><div className="text-2xl mb-1">📷</div><div className="text-[11px] font-extrabold uppercase">Camera</div></button></div>
+                <div><input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile}/><button onClick={()=>{if(!apiKey){setError('Enter API key first');return}fileRef.current?.click()}} className="w-full bg-slate-200 hover:bg-slate-300 p-4 rounded-xl text-center"><div className="text-2xl mb-1">📁</div><div className="text-[11px] font-extrabold uppercase">Upload</div></button></div>
+            </div>)}
+            {scanning&&<div className="text-center py-6 fade-in"><div className="inline-block w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-3"></div><p className="text-sm font-bold text-blue-300">{progress}</p></div>}
+            {preview&&!scanning&&<div className="fade-in"><img src={preview} className="w-full h-28 object-cover rounded-xl border border-slate-300 mb-3"/><button onClick={()=>{setPreview(null);setError('')}} className="w-full bg-slate-200 hover:bg-slate-300 py-2 rounded-xl text-xs font-bold uppercase">Scan Another</button></div>}
+            {error&&<div className="mt-3 bg-red-50 border border-red-500/30 rounded-xl p-3"><p className="text-xs font-bold text-red-400">⚠ {error}</p></div>}
+        </div>);
+}
+
+/* === REVIEW TABLE === */
+function ReviewTable({reviewData:rd,setReviewData:srd,onConfirm,allowance,sheetTotals,scanWarn}){
+    const ded=parseFloat(allowance)||0;
+    const cnt=useMemo(()=>({p:rd.filter(r=>r.status==='pending').length,a:rd.filter(r=>r.status==='approved').length,r:rd.filter(r=>r.status==='rejected').length}),[rd]);
+    const up=(id,f,v)=>srd(p=>p.map(r=>r.id===id?{...r,[f]:v,edited:true}:r));
+    const ss=(id,s)=>srd(p=>p.map(r=>r.id===id?{...r,status:s}:r));
+    const insertAfter=(sno)=>{srd(prev=>{const idx=prev.findIndex(r=>r.sno===sno);const newRow={id:Date.now(),sno:sno+0.5,grade:'',l_in:0,w_in:0,l_cm:0,w_cm:0,status:'pending',edited:true};
+        const next=[...prev];next.splice(idx+1,0,newRow);return next.map((r,i)=>({...r,sno:i+1}))})};
+    const removeRow=(id)=>{srd(prev=>prev.filter(r=>r.id!==id).map((r,i)=>({...r,sno:i+1})))};
+    /* Arrow key navigation */
+    const cols=['l_in','w_in','l_cm','w_cm'];
+    const[focusRow,setFocusRow]=useState(0);
+    const[focusCol,setFocusCol]=useState(0);
+    const tableRef=useRef(null);
+    const focusCell=(r,c)=>{
+        const inp=tableRef.current?.querySelector(`[data-row="${r}"][data-col="${c}"]`);
+        if(inp){inp.focus();inp.select();setFocusRow(r);setFocusCol(c)}
+    };
+    const handleKey=(e)=>{
+        if(e.key==='ArrowDown'){e.preventDefault();focusCell(Math.min(focusRow+1,rd.length-1),focusCol)}
+        else if(e.key==='ArrowUp'){e.preventDefault();focusCell(Math.max(focusRow-1,0),focusCol)}
+        else if(e.key==='ArrowRight'||e.key==='Tab'){e.preventDefault();focusCell(focusRow,Math.min(focusCol+1,cols.length-1))}
+        else if(e.key==='ArrowLeft'){e.preventDefault();focusCell(focusRow,Math.max(focusCol-1,0))}
+        else if(e.key==='Enter'){e.preventDefault();focusCell(Math.min(focusRow+1,rd.length-1),0)}
+    };
+    /* Calculated totals from scanned data */
+    const scannedSqfIn=rd.reduce((a,r)=>a+((r.l_in*r.w_in)/144),0).toFixed(2);
+    const scannedSqfCm=rd.reduce((a,r)=>a+((r.l_cm*r.w_cm)/929.03),0).toFixed(2);
+    return(
+        <div className="bg-slate-50 border border-amber-500/30 rounded-2xl overflow-hidden fade-in">
+            <div className="p-4" style={{background:'linear-gradient(135deg,#d97706,#ea580c)'}}><div className="flex justify-between items-center flex-wrap gap-2">
+                <h3 className="text-sm font-extrabold uppercase text-white">Review Scanned Data</h3>
+                <div className="flex gap-1.5 text-[10px]"><span className="bg-black/20 px-2 py-1 rounded font-bold">{cnt.p}⏳</span><span className="bg-black/20 px-2 py-1 rounded font-bold">{cnt.a}✓</span><span className="bg-black/20 px-2 py-1 rounded font-bold">{cnt.r}✕</span></div>
+            </div><div className="flex gap-2 mt-3">
+                <button onClick={()=>srd(p=>p.map(r=>r.status==='pending'?{...r,status:'approved'}:r))} className="bg-green-600 px-4 py-1.5 rounded-lg text-[10px] font-extrabold uppercase text-white">✓ Approve All</button>
+                <button onClick={()=>srd(p=>p.map(r=>({...r,status:'pending'})))} className="bg-slate-200 px-4 py-1.5 rounded-lg text-[10px] font-extrabold uppercase text-white">↺ Reset</button>
+                <button onClick={()=>insertAfter(rd.length)} className="bg-blue-600 px-4 py-1.5 rounded-lg text-[10px] font-extrabold uppercase text-white">+ Add Row</button>
+            </div></div>
+            {/* Warning Banner */}
+            {scanWarn&&<div className="p-3 bg-red-50 border-b border-red-500/30"><p className="text-xs font-bold text-red-400">{scanWarn}</p></div>}
+            {/* Sheet vs Scanned Totals */}
+            <div className="p-3 bg-slate-100 border-b border-slate-300">
+                <div className="flex flex-wrap gap-5 items-center text-[10px]">
+                    <div><span className="text-slate-600 font-bold uppercase">Slabs:</span> <span className="mono font-extrabold text-slate-700 text-base">{rd.length}</span>
+                        {sheetTotals&&sheetTotals.count&&<span className={"font-bold ml-1 "+(rd.length===sheetTotals.count?'text-green-400':'text-red-400')}>(Sheet: {sheetTotals.count}{rd.length===sheetTotals.count?' ✓':' ≠'})</span>}
+                    </div>
+                    <div><span className="text-orange-500 font-bold uppercase">SQF(In):</span> <span className="mono font-extrabold text-orange-600 text-base">{scannedSqfIn}</span>
+                        {sheetTotals&&sheetTotals.grand_total_sqf&&<span className={"font-bold ml-1 "+(Math.abs(parseFloat(scannedSqfIn)-sheetTotals.grand_total_sqf)<1?'text-green-600':'text-red-600')}>(Sheet: {sheetTotals.grand_total_sqf}{Math.abs(parseFloat(scannedSqfIn)-sheetTotals.grand_total_sqf)<1?' ✓':' ≠'})</span>}
+                    </div>
+                    <div><span className="text-blue-500 font-bold uppercase">SQF(CM):</span> <span className="mono font-extrabold text-blue-600 text-base">{scannedSqfCm}</span></div>
+                    <div><span className="text-amber-500 font-bold uppercase">Diff:</span> <span className="mono font-extrabold text-amber-600">{(parseFloat(scannedSqfCm)-parseFloat(scannedSqfIn)).toFixed(2)}</span></div>
+                </div>
+            </div>
+            <div className="overflow-x-auto" ref={tableRef}><table className="w-full text-center text-[11px]"><thead><tr className="bg-slate-100 text-[8px] uppercase text-slate-600">
+                <th className="p-2">S.No</th><th className="p-2">Gr</th><th className="p-2 text-orange-500">In L</th><th className="p-2 text-orange-500">In Ht</th><th className="p-2 text-orange-500">SQF(In)</th><th className="p-2 text-blue-500">CM L</th><th className="p-2 text-blue-500">CM Ht</th><th className="p-2 text-blue-500">SQF(CM)</th><th className="p-2">St</th><th className="p-2">Act</th>
+            </tr></thead><tbody>{rd.map((r,ri)=>(
+                <tr key={r.id} className={"border-t border-slate-200 "+(ri===focusRow?'bg-blue-50 ':' ')+(r.status==='approved'?'bg-green-50':r.status==='rejected'?'bg-red-50 opacity-50':'')}>
+                    <td className="p-2 mono font-bold text-slate-600">{r.sno}</td>
+                    <td className="p-2"><select value={r.grade} onChange={e=>up(r.id,'grade',e.target.value)} className={"bg-transparent font-extrabold outline-none "+(r.grade==='F'?'text-blue-600':r.grade==='G'?'text-emerald-600':'text-slate-400')}><option value="">-</option><option value="F">F</option><option value="G">G</option></select></td>
+                    <td className="p-1"><input type="number" data-row={ri} data-col="0" value={r.l_in} onFocus={()=>{setFocusRow(ri);setFocusCol(0)}} onKeyDown={handleKey} onChange={e=>up(r.id,'l_in',parseFloat(e.target.value)||0)} className={"w-14 text-center p-1 rounded mono font-bold outline-none text-xs "+(r.edited?'bg-amber-50 border border-amber-400 text-amber-700':'bg-white border border-slate-300 text-orange-700')}/></td>
+                    <td className="p-1"><input type="number" data-row={ri} data-col="1" value={r.w_in} onFocus={()=>{setFocusRow(ri);setFocusCol(1)}} onKeyDown={handleKey} onChange={e=>up(r.id,'w_in',parseFloat(e.target.value)||0)} className={"w-14 text-center p-1 rounded mono font-bold outline-none text-xs "+(r.edited?'bg-amber-50 border border-amber-400 text-amber-700':'bg-white border border-slate-300 text-orange-700')}/></td>
+                    <td className="p-2 mono font-bold text-orange-600">{((r.l_in*r.w_in)/144).toFixed(2)}</td>
+                    <td className="p-1"><input type="number" data-row={ri} data-col="2" value={r.l_cm} onFocus={()=>{setFocusRow(ri);setFocusCol(2)}} onKeyDown={handleKey} onChange={e=>up(r.id,'l_cm',parseFloat(e.target.value)||0)} className={"w-14 text-center p-1 rounded mono font-bold outline-none text-xs "+(r.edited?'bg-amber-50 border border-amber-400 text-amber-700':'bg-white border border-slate-300 text-blue-700')}/></td>
+                    <td className="p-1"><input type="number" data-row={ri} data-col="3" value={r.w_cm} onFocus={()=>{setFocusRow(ri);setFocusCol(3)}} onKeyDown={handleKey} onChange={e=>up(r.id,'w_cm',parseFloat(e.target.value)||0)} className={"w-14 text-center p-1 rounded mono font-bold outline-none text-xs "+(r.edited?'bg-amber-50 border border-amber-400 text-amber-700':'bg-white border border-slate-300 text-blue-700')}/></td>
+                    <td className="p-2 mono font-bold text-blue-600">{((r.l_cm*r.w_cm)/929.03).toFixed(2)}</td>
+                    <td className="p-2">{r.status==='pending'?'⏳':r.status==='approved'?<span className="text-green-500 font-bold">✓</span>:<span className="text-red-600 font-bold">✕</span>}</td>
+                    <td className="p-1.5"><div className="flex gap-1 justify-center">
+                        <button onClick={()=>ss(r.id,'approved')} className={"w-7 h-7 rounded text-xs font-bold "+(r.status==='approved'?'bg-green-500 text-white':'bg-slate-200 text-green-600')}>✓</button>
+                        <button onClick={()=>ss(r.id,'rejected')} className={"w-7 h-7 rounded text-xs font-bold "+(r.status==='rejected'?'bg-red-500 text-white':'bg-slate-200 text-red-600')}>✕</button>
+                        <button onClick={()=>insertAfter(r.sno)} title="Insert row after" className="w-7 h-7 rounded text-xs font-bold bg-slate-200 text-blue-600 hover:bg-blue-600 hover:text-white">+</button>
+                        <button onClick={()=>removeRow(r.id)} title="Delete row" className="w-7 h-7 rounded text-xs font-bold bg-slate-200 text-red-400 hover:bg-red-600 hover:text-white">🗑</button>
+                    </div></td>
+                </tr>))}
+                {/* TOTALS ROW */}
+                <tr className="bg-slate-100 border-t-2 border-slate-400">
+                    <td className="p-2 font-extrabold text-slate-700 text-left" colSpan="2">TOTAL ({rd.length})</td>
+                    <td colSpan="2"></td>
+                    <td className="p-2 mono font-extrabold text-orange-600 text-sm">{scannedSqfIn}</td>
+                    <td colSpan="2"></td>
+                    <td className="p-2 mono font-extrabold text-blue-600 text-sm">{scannedSqfCm}</td>
+                    <td colSpan="2"></td>
+                </tr>
+                </tbody></table></div>
+            {cnt.a>0&&<div className="p-4 bg-slate-100/50 border-t border-slate-300"><div className="flex justify-between items-center flex-wrap gap-3">
+                <p className="text-xs text-slate-600">Ready: <span className="text-green-400 font-bold text-lg">{cnt.a}</span></p>
+                <button onClick={()=>onConfirm(rd.filter(r=>r.status==='approved'))} className="bg-green-600 px-6 py-3 rounded-xl text-sm font-extrabold uppercase text-white">Add to Packing List →</button>
+            </div></div>}
+        </div>);
+}
+/* === EXPORTS === */
+function getLenSummary(ent){const cat={o300:0,o250:0,o200:0,o150:0,o130:0,o120:0,o110:0,o100:0,b100:0};
+    ent.forEach(e=>{const l=parseFloat(e.gL);if(l>=300)cat.o300++;else if(l>=250)cat.o250++;else if(l>=200)cat.o200++;else if(l>=150)cat.o150++;else if(l>=130)cat.o130++;else if(l>=120)cat.o120++;else if(l>=110)cat.o110++;else if(l>=100)cat.o100++;else cat.b100++});return cat}
+
+function exportExcel(ent,hdr,mode){const wb=XLSX.utils.book_new();const isO=mode==='office';const rows=[];
+    rows.push([isO?'KEIPL - Office Copy (CONFIDENTIAL)':'Packing List - '+(hdr.customer||'Customer')]);
+    rows.push(['Customer: '+hdr.customer,'','Container: '+hdr.container,'','Date: '+hdr.inspectDate]);
+    rows.push(['Colour: '+hdr.colour,'','Destination: '+hdr.destination,'','Thickness: '+hdr.defThick+' cm']);
+    rows.push(['Report: '+hdr.reportNo,'','Invoice: '+hdr.invoiceNo]);rows.push([]);
+    if(isO){
+        rows.push(['Slab No','Grade','In L','In Ht','SQF(In)','CM L','CM Ht','SQF(CM)','Gross m²','Margin m²','Allow(cm)','Cust Allow m²','Retained m²','Net L','Net Ht','Net m²']);
+        ent.forEach(e=>rows.push([e.slabNo,e.grade||'-',e.inL,e.inW,e.sqfIn,e.gL,e.gW,e.sqfCm,e.gSqm,e.totalMargin,e.allType+' cm',e.custAllow,e.retained,e.nL,e.nW,e.nSqm]));
+        rows.push([]);const tI=ent.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0);const tIC=ent.reduce((a,b)=>a+parseFloat(b.sqfCm||0),0);const tG=ent.reduce((a,b)=>a+parseFloat(b.gSqm||0),0);const tN=ent.reduce((a,b)=>a+parseFloat(b.nSqm||0),0);
+        const tM=ent.reduce((a,b)=>a+parseFloat(b.totalMargin||0),0);const tC=ent.reduce((a,b)=>a+parseFloat(b.custAllow||0),0);const tR=ent.reduce((a,b)=>a+parseFloat(b.retained||0),0);
+        rows.push(['TOTALS','','','',tI.toFixed(3),'','',tIC.toFixed(3),tG.toFixed(3),tM.toFixed(3),'',tC.toFixed(3),tR.toFixed(3),'','',tN.toFixed(3)]);
+        rows.push([]);rows.push(['GRADE BREAKDOWN']);
+        ['F','G'].forEach(g=>{const ge=ent.filter(e=>e.grade===g);if(ge.length){
+            rows.push(['Grade '+g,ge.length+' slabs','','','SQF: '+ge.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0).toFixed(3),'','','Gross: '+ge.reduce((a,b)=>a+parseFloat(b.gSqm||0),0).toFixed(3),'','','','Retained: '+ge.reduce((a,b)=>a+parseFloat(b.retained||0),0).toFixed(3)])}});
+    }else{
+        rows.push(['Slab No','Gross L(cm)','Gross Ht(cm)','Gross m²','Allowance(cm)','Net L(cm)','Net Ht(cm)','Net m²']);
+        ent.forEach(e=>rows.push([e.slabNo,e.gL,e.gW,e.gSqm,e.allType+' cm',e.nL,e.nW,e.nSqm]));
+        rows.push([]);const tG=ent.reduce((a,b)=>a+parseFloat(b.gSqm||0),0);const tN=ent.reduce((a,b)=>a+parseFloat(b.nSqm||0),0);
+        rows.push(['','','','GROSS: '+tG.toFixed(3),'','','TOTAL:',tN.toFixed(3)]);
+        /* Length Summary */
+        const ls=getLenSummary(ent);rows.push([]);rows.push(['LENGTH SUMMARY (Gross)']);
+        rows.push(['300+ cm:',ls.o300+' slabs']);rows.push(['250-299 cm:',ls.o250+' slabs']);rows.push(['200-249 cm:',ls.o200+' slabs']);
+        rows.push(['150-199 cm:',ls.o150+' slabs']);rows.push(['130-149 cm:',ls.o130+' slabs']);rows.push(['120-129 cm:',ls.o120+' slabs']);
+        rows.push(['110-119 cm:',ls.o110+' slabs']);rows.push(['100-109 cm:',ls.o100+' slabs']);rows.push(['Below 100 cm:',ls.b100+' slabs']);
+        rows.push(['Total:',ent.length+' slabs']);
+    }
+    const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=Array(16).fill({wch:12});
+    XLSX.utils.book_append_sheet(wb,ws,isO?'Office':'Customer');XLSX.writeFile(wb,'KEIPL_'+(isO?'Office':'Customer')+'_'+(hdr.customer||'export')+'.xlsx');}
+
+function exportPDF(ent,hdr,mode){const{jsPDF}=window.jspdf;const doc=new jsPDF({orientation:'landscape',unit:'mm',format:'a4'});const isO=mode==='office';
+    doc.setFontSize(14);doc.setFont('helvetica','bold');doc.text('KUIPER EXPORTS & IMPORTS PVT LTD',148,12,{align:'center'});
+    doc.setFontSize(9);doc.setFont('helvetica','normal');doc.text(isO?'OFFICE COPY - CONFIDENTIAL':'PACKING LIST / MEASUREMENT CERTIFICATE',148,18,{align:'center'});
+    doc.setFontSize(8);doc.text('Customer: '+(hdr.customer||'-'),14,26);doc.text('Container: '+(hdr.container||'-'),100,26);doc.text('Date: '+hdr.inspectDate,220,26);
+    doc.text('Colour: '+(hdr.colour||'-'),14,31);doc.text('Destination: '+(hdr.destination||'-'),100,31);doc.text('Report: '+(hdr.reportNo||'-'),220,31);
+    doc.text('Invoice: '+(hdr.invoiceNo||'-'),14,36);doc.text('Thickness: '+(hdr.defThick||'2')+' cm',100,36);
+    let hd,bd;
+    if(isO){hd=[['#','Slab','Gr','In L×Ht','SQF(In)','CM L×Ht','SQF(CM)','Grs m²','Mrgn','All','CAll','Kept','Net L×Ht','Net m²']];
+        bd=ent.map((e,i)=>[i+1,e.slabNo,e.grade||'-',e.inL+'×'+e.inW,e.sqfIn,e.gL+'×'+e.gW,e.sqfCm,e.gSqm,e.totalMargin,e.allType,e.custAllow,e.retained,e.nL+'×'+e.nW,e.nSqm]);
+    }else{hd=[['#','Slab No','Gross L','Gross Ht','Gross m²','Allow(cm)','Net L','Net Ht','Net m²']];
+        bd=ent.map((e,i)=>[i+1,e.slabNo,e.gL,e.gW,e.gSqm,e.allType+' cm',e.nL,e.nW,e.nSqm]);}
+    doc.autoTable({head:hd,body:bd,startY:40,styles:{fontSize:6.5,cellPadding:1.2},headStyles:{fillColor:[30,58,138],textColor:255,fontSize:6.5},alternateRowStyles:{fillColor:[245,247,250]},margin:{left:8,right:8}});
+    const tN=ent.reduce((a,b)=>a+parseFloat(b.nSqm||0),0);const fy=doc.lastAutoTable.finalY+6;
+    doc.setFontSize(9);doc.setFont('helvetica','bold');
+    const tG2=ent.reduce((a,b)=>a+parseFloat(b.gSqm||0),0);
+    doc.text('Total: '+ent.length+' slabs | Gross: '+tG2.toFixed(3)+' m² | Net: '+tN.toFixed(3)+' m²',14,fy);
+    if(isO){const tR=ent.reduce((a,b)=>a+parseFloat(b.retained||0),0);const tI=ent.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0);const tIC=ent.reduce((a,b)=>a+parseFloat(b.sqfCm||0),0);
+        doc.text('SQF(In): '+tI.toFixed(3)+' | SQF(CM): '+tIC.toFixed(3)+' | Retained: '+tR.toFixed(3)+' m²',14,fy+5)}
+    /* Length Summary on both copies */
+    const ls=getLenSummary(ent);const ly=isO?fy+12:fy+8;
+    doc.setFontSize(8);doc.setFont('helvetica','bold');doc.text('LENGTH SUMMARY (Gross):',14,ly);
+    doc.setFont('helvetica','normal');
+    doc.text('300+: '+ls.o300+' | 250-299: '+ls.o250+' | 200-249: '+ls.o200+' | 150-199: '+ls.o150+' | 130-149: '+ls.o130,14,ly+4);
+    doc.text('120-129: '+ls.o120+' | 110-119: '+ls.o110+' | 100-109: '+ls.o100+' | <100: '+ls.b100+' | Total: '+ent.length,14,ly+8);
+    const sy=ly+18;doc.setFontSize(8);doc.setFont('helvetica','normal');doc.line(14,sy,70,sy);doc.text('Authorized Signatory',14,sy+4);doc.line(200,sy,270,sy);doc.text('Inspector',200,sy+4);
+    const ph=ent.filter(e=>e.photo);if(ph.length>0){doc.addPage();doc.setFontSize(12);doc.setFont('helvetica','bold');doc.text('SLAB PHOTOGRAPHS',148,12,{align:'center'});
+        let px=14,py=22,cW=65,rH=50;ph.forEach((e,i)=>{if(py+rH>190){doc.addPage();py=15}try{doc.addImage(e.photo,'JPEG',px,py,cW-5,rH-10);doc.setFontSize(6);doc.text(e.slabNo+' | '+e.gL+'×'+e.gW,px,py+rH-6)}catch(x){}px+=cW;if((i+1)%4===0){px=14;py+=rH}})}
+    doc.save('KEIPL_'+(isO?'Office':'Customer')+'_'+(hdr.customer||'export')+'.pdf');}
+/* === MAIN APP === */
+function App(){
+    const[header,setHeader]=useState(()=>{try{const s=localStorage.getItem('keipl_v101_h');if(s){return{...DH,...JSON.parse(s)}}return{...DH}}catch{return{...DH}}});
+    const[entries,setEntries]=useState(()=>{try{const s=localStorage.getItem('keipl_v101_e');return s?JSON.parse(s):[]}catch{return[]}});
+    const[cur,setCur]=useState({inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});
+    const[bulkText,setBulk]=useState('');const[editId,setEditId]=useState(null);const[fRange,setFRange]=useState('All');
+    const[revData,setRevData]=useState(null);const[tab,setTab]=useState('scan');const[showExp,setShowExp]=useState(false);
+    const[zoomPh,setZoomPh]=useState(null);const[showPh,setShowPh]=useState(true);
+    const[sheetTotals,setSheetTotals]=useState(null);const[scanWarn,setScanWarn]=useState('');
+
+    useEffect(()=>{try{localStorage.setItem('keipl_v101_h',JSON.stringify(header))}catch{}},[header]);
+    useEffect(()=>{try{localStorage.setItem('keipl_v101_e',JSON.stringify(entries.map(e=>({...e,photo:e.photo?e.photo.substring(0,200000):null}))))}catch{}},[entries]);
+
+    const live=useMemo(()=>{
+        const ded=parseFloat(header.allowance)||0;
+        return entries.map(e=>{
+            const il=parseFloat(e.inL)||0,iw=parseFloat(e.inW)||0,gl=parseFloat(e.gL)||0,gw=parseFloat(e.gW)||0;
+            const nl=gl>ded?gl-ded:gl,nw=gw>ded?gw-ded:gw;
+            const sqfIn=((il*iw)/144).toFixed(3),sqmIn=((il*iw*6.4516)/10000).toFixed(3);
+            const sqfCm=((gl*gw)/929.03).toFixed(2);
+            const gSqm=((gl*gw)/10000).toFixed(3),nSqm=((nl*nw)/10000).toFixed(3);
+            const totalMargin=(parseFloat(gSqm)-parseFloat(sqmIn)).toFixed(3);
+            const custAllow=(parseFloat(gSqm)-parseFloat(nSqm)).toFixed(3);
+            const retained=(parseFloat(totalMargin)-parseFloat(custAllow)).toFixed(3);
+            return{...e,nL:nl.toString(),nW:nw.toString(),sqfIn,sqfCm,sqmIn,gSqm,nSqm,totalMargin,custAllow,retained,allType:header.allowance};
+        });
+    },[entries,header.allowance]);
+
+    const sortEntries=(arr)=>arr.sort((a,b)=>{const na=parseInt(a.slabNo.replace(/\D/g,''))||0,nb=parseInt(b.slabNo.replace(/\D/g,''))||0;return na-nb});
+
+    const addUp=()=>{if(!cur.gL||!cur.gW)return;
+        if(editId){setEntries(p=>sortEntries(p.map(e=>e.id===editId?{...e,inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||e.grade,photo:cur.photo||e.photo}:e)));setEditId(null)}
+        else{setEntries(p=>sortEntries([...p,{id:Date.now(),slabNo:'KEIPL/'+(p.length+1).toString().padStart(2,'0'),inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||'',photo:cur.photo}]))}
+        setCur({inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});};
+
+    const doBulk=()=>{const rows=bulkText.trim().split('\n');
+        const ne=rows.map((row,i)=>{const c=row.split(/\t|,/).map(x=>x.trim());const gl=parseFloat(c[2]||c[0]);if(!gl)return null;
+            return{id:Date.now()+i,slabNo:'KEIPL/'+(entries.length+i+1).toString().padStart(2,'0'),inL:c[0]||'0',inW:c[1]||'0',gL:c[2]||c[0]||'0',gW:c[3]||c[1]||'0',grade:c[4]||'',photo:null}
+        }).filter(Boolean);setEntries(p=>sortEntries([...p,...ne]));setBulk('')};
+
+    const doConfirm=(ap)=>{const ne=ap.map((it,i)=>({id:Date.now()+i,slabNo:'KEIPL/'+(entries.length+i+1).toString().padStart(2,'0'),
+        inL:it.l_in.toString(),inW:it.w_in.toString(),gL:it.l_cm.toString(),gW:it.w_cm.toString(),grade:it.grade,photo:null}));
+        setEntries(p=>sortEntries([...p,...ne]));setRevData(null)};
+
+    const stats=useMemo(()=>{
+        const tI=live.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0),tIC=live.reduce((a,b)=>a+parseFloat(b.sqfCm||0),0),tG=live.reduce((a,b)=>a+parseFloat(b.gSqm||0),0),tN=live.reduce((a,b)=>a+parseFloat(b.nSqm||0),0);
+        const tM=live.reduce((a,b)=>a+parseFloat(b.totalMargin||0),0),tC=live.reduce((a,b)=>a+parseFloat(b.custAllow||0),0),tR=live.reduce((a,b)=>a+parseFloat(b.retained||0),0);
+        const cat={o300:0,o250:0,o200:0,o150:0,o130:0,o120:0,o110:0,o100:0,b100:0};
+        live.forEach(e=>{const l=parseFloat(e.gL);if(l>=300)cat.o300++;else if(l>=250)cat.o250++;else if(l>=200)cat.o200++;else if(l>=150)cat.o150++;else if(l>=130)cat.o130++;else if(l>=120)cat.o120++;else if(l>=110)cat.o110++;else if(l>=100)cat.o100++;else cat.b100++});
+        const gs={};['F','G'].forEach(g=>{const ge=live.filter(e=>e.grade===g);gs[g]={n:ge.length,sqf:ge.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0).toFixed(3),gm:ge.reduce((a,b)=>a+parseFloat(b.gSqm||0),0).toFixed(3),ret:ge.reduce((a,b)=>a+parseFloat(b.retained||0),0).toFixed(3)}});
+        return{tI:tI.toFixed(3),tIC:tIC.toFixed(3),gA:tG.toFixed(3),nA:tN.toFixed(3),tM:tM.toFixed(3),tC:tC.toFixed(3),tR:tR.toFixed(3),pA:tG>0?(((tG-tN)/tG)*100).toFixed(2):0,cat,gs};
+    },[live]);
+
+    const filt=live.filter(e=>{const l=parseFloat(e.gL);if(fRange==='300+')return l>=300;if(fRange==='250+')return l>=250&&l<300;if(fRange==='200+')return l>=200&&l<250;if(fRange==='<200')return l<200;return true});
+    return(
+        <div className="max-w-7xl mx-auto p-3 md:py-5">
+            {zoomPh&&<div className="modal-bg" onClick={()=>setZoomPh(null)}><img src={zoomPh}/></div>}
+            <div className="flex flex-wrap justify-between items-center gap-3 mb-5 no-print">
+                <div className="flex gap-2 flex-wrap">
+                    <button onClick={()=>{if(confirm("Clear slab table?"))setEntries([])}} className="bg-slate-100 text-orange-400 px-3 py-2 rounded-lg text-[10px] font-extrabold uppercase border border-orange-500/20">Clear Table</button>
+                    <button onClick={()=>{if(confirm("⚠ HARD RESET ALL?")){setEntries([]);setHeader({...DH});setRevData(null);setCur({inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});setBulk('');setEditId(null);setFRange('All');try{localStorage.removeItem('keipl_v101_h');localStorage.removeItem('keipl_v101_e');localStorage.removeItem('keipl_api_key')}catch{}}}} className="bg-red-100 text-red-600 px-3 py-2 rounded-lg text-[10px] font-extrabold uppercase border border-red-500/30">⚠ Hard Reset</button>
+                    <div className="flex items-center gap-2 bg-slate-100 px-3 py-2 rounded-lg border border-slate-300"><span className="text-[9px] font-extrabold uppercase text-slate-600">Photos:</span><input type="checkbox" checked={showPh} onChange={e=>setShowPh(e.target.checked)} className="w-4 h-4"/></div>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                    <div className="relative"><button onClick={()=>setShowExp(!showExp)} className="bg-emerald-700 hover:bg-emerald-600 text-white px-5 py-2 rounded-lg text-[10px] font-extrabold uppercase shadow-lg">⬇ Export ▾</button>
+                        {showExp&&<div className="absolute right-0 top-10 bg-slate-100 border border-slate-300 rounded-xl p-3 shadow-2xl z-50 w-56 fade-in">
+                            <p className="text-[9px] font-extrabold text-slate-600 uppercase mb-2">Office (Full + Margins)</p>
+                            <button onClick={()=>{exportExcel(live,header,'office');setShowExp(false)}} className="w-full text-left px-3 py-2 rounded-lg text-xs font-bold text-emerald-300 hover:bg-slate-200 mb-1">📊 Excel Office</button>
+                            <button onClick={()=>{exportPDF(live,header,'office');setShowExp(false)}} className="w-full text-left px-3 py-2 rounded-lg text-xs font-bold text-emerald-300 hover:bg-slate-200 mb-3">📄 PDF Office</button>
+                            <p className="text-[9px] font-extrabold text-slate-600 uppercase mb-2 border-t border-slate-300 pt-2">Customer (Net + Allow)</p>
+                            <button onClick={()=>{exportExcel(live,header,'customer');setShowExp(false)}} className="w-full text-left px-3 py-2 rounded-lg text-xs font-bold text-blue-300 hover:bg-slate-200 mb-1">📊 Excel Customer</button>
+                            <button onClick={()=>{exportPDF(live,header,'customer');setShowExp(false)}} className="w-full text-left px-3 py-2 rounded-lg text-xs font-bold text-blue-300 hover:bg-slate-200">📄 PDF Customer</button>
+                        </div>}</div>
+                    <button onClick={()=>window.print()} className="bg-blue-600 text-white px-6 py-2 rounded-lg text-[10px] font-extrabold uppercase shadow-lg">🖨 Print</button>
+                </div>
+            </div>
+
+            <div className="bg-slate-50 p-6 border-t-4 border-blue-500 shadow-xl mb-5 rounded-2xl border border-slate-200">
+                <div className="flex justify-between items-start mb-6">
+                    <div><h1 className="text-4xl md:text-5xl font-black text-blue-400 tracking-tighter leading-none">KUIPER</h1><p className="text-[10px] font-bold text-slate-600 uppercase tracking-[0.3em] mt-2">Smart Marking V10.1</p></div>
+                    <div className="text-right space-y-1"><div className="p-1"><label className="text-[9px] font-extrabold text-slate-600 block uppercase">Date</label><input type="date" className="font-bold text-sm outline-none bg-transparent text-slate-700" value={header.inspectDate} onChange={e=>setHeader({...header,inspectDate:e.target.value})}/></div>
+                    <p className="text-[10px] font-extrabold text-blue-400 bg-blue-50 px-3 py-1 rounded-lg">{header.reportNo||'NEW'}</p></div>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-4">{['customer','container','factory','destination','colour','marker','supervisor','reportNo','invoiceNo'].map(k=>(
+                    <div key={k} className="border-b border-slate-200 pb-1"><label className="block text-[9px] font-extrabold text-slate-600 uppercase mb-1">{k}</label>
+                    <input className="w-full font-bold text-xs outline-none uppercase bg-transparent text-slate-700" value={header[k]} onChange={e=>setHeader({...header,[k]:e.target.value})}/></div>
+                ))}</div>
+            </div>
+
+            <div className="no-print mb-5">
+                <div className="flex gap-1 mb-3 bg-slate-50 p-1 rounded-xl w-fit">{[{id:'scan',l:'📸 AI Scan'},{id:'bulk',l:'📋 Bulk'},{id:'manual',l:'✏️ Manual'}].map(t=>(
+                    <button key={t.id} onClick={()=>setTab(t.id)} className={"px-4 py-2 rounded-lg text-xs font-bold "+(tab===t.id?'bg-blue-600 text-white':'text-slate-600 hover:text-white hover:bg-slate-100')}>{t.l}</button>))}</div>
+                <div className="flex items-center gap-3 bg-slate-50/50 p-2.5 rounded-xl w-fit border border-slate-200 mb-4">
+                    <label className="text-[10px] font-extrabold text-blue-400 uppercase">Customer Allowance:</label>
+                    <div className="flex gap-1">{['0','2','3','5'].map(v=>(<button key={v} onClick={()=>setHeader({...header,allowance:v})} className={"px-4 py-2 rounded-lg text-xs font-extrabold "+(header.allowance===v?'bg-blue-600 text-white shadow-lg':'bg-slate-100 text-slate-600')}>{v==='0'?'None':v+' cm'}</button>))}</div>
+                    <span className="text-[10px] text-emerald-400 font-bold ml-2">← Live recalc</span>
+                </div>
+
+                {tab==='scan'&&!revData&&<OCRScanner onDataExtracted={(data,totals,warn)=>{setRevData(data);setSheetTotals(totals||null);setScanWarn(warn||'')}}/>}
+                {revData&&<ReviewTable reviewData={revData} setReviewData={setRevData} onConfirm={doConfirm} allowance={header.allowance} sheetTotals={sheetTotals} scanWarn={scanWarn}/>}
+
+                {tab==='bulk'&&!revData&&(<div className="bg-slate-50 p-5 rounded-2xl border border-slate-200">
+                    <h3 className="text-xs font-extrabold uppercase text-slate-600 mb-3">Bulk — InL,InHt,CmL,CmHt[,Grade] (Grade optional)</h3>
+                    <textarea className="w-full h-28 p-3 text-xs mono border border-slate-300 rounded-xl outline-none bg-slate-100 text-slate-700 resize-none" placeholder={"67,35,180,95,F\n68,35,184,95\n43,36,0,0"} value={bulkText} onChange={e=>setBulk(e.target.value)}/>
+                    <button onClick={doBulk} className="mt-3 bg-slate-200 text-white px-8 py-2.5 rounded-xl text-[11px] font-extrabold uppercase">Import</button>
+                </div>)}
+
+                {tab==='manual'&&!revData&&(<div className="bg-slate-50 text-white p-5 rounded-2xl border border-slate-200 max-w-lg">
+                    <h3 className="text-xs font-extrabold text-blue-400 uppercase mb-4">Manual — Slab {entries.length+1}</h3>
+                    <div className="space-y-3">
+                        <p className="text-[9px] font-extrabold text-orange-400 uppercase">Buying (Inches)</p>
+                        <div className="grid grid-cols-2 gap-2">
+                            <input type="number" placeholder="Length (in)" className="p-3 rounded-lg bg-slate-100 border border-orange-500/30 font-bold mono outline-none text-orange-200" value={cur.inL} onChange={e=>setCur({...cur,inL:e.target.value})}/>
+                            <input type="number" placeholder="Height (in)" className="p-3 rounded-lg bg-slate-100 border border-orange-500/30 font-bold mono outline-none text-orange-200" value={cur.inW} onChange={e=>setCur({...cur,inW:e.target.value})}/>
+                        </div>
+                        <p className="text-[9px] font-extrabold text-blue-400 uppercase">Selling (CMS)</p>
+                        <div className="grid grid-cols-3 gap-2">
+                            <input type="number" placeholder="Length (cm)" className="p-3 rounded-lg bg-slate-100 border border-blue-500/30 font-bold mono outline-none text-blue-200" value={cur.gL} onChange={e=>setCur({...cur,gL:e.target.value})}/>
+                            <input type="number" placeholder="Height (cm)" className="p-3 rounded-lg bg-slate-100 border border-blue-500/30 font-bold mono outline-none text-blue-200" value={cur.gW} onChange={e=>setCur({...cur,gW:e.target.value})}/>
+                            <select value={cur.grade||''} onChange={e=>setCur({...cur,grade:e.target.value})} className="p-3 rounded-lg bg-slate-100 border border-slate-300 font-bold outline-none"><option value="">Gr</option><option value="F">F</option><option value="G">G</option></select>
+                        </div>
+                        <div className="flex items-center gap-2"><input type="file" accept="image/*" capture="environment" className="hidden" id="slab-ph" onChange={e=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onloadend=()=>setCur(p=>({...p,photo:r.result}));r.readAsDataURL(f)}}/>
+                            <label htmlFor="slab-ph" className="cursor-pointer bg-slate-200 hover:bg-slate-300 p-3 rounded-lg flex-1 text-center text-[10px] font-bold uppercase">{cur.photo?"✅ Photo":"📷 Slab Photo"}</label>
+                            {cur.photo&&<button onClick={()=>setCur(p=>({...p,photo:null}))} className="text-red-400 font-bold text-lg px-2">✕</button>}</div>
+                        {cur.photo&&<img src={cur.photo} className="w-full h-24 object-cover rounded-lg border border-slate-300"/>}
+                    </div>
+                    <button onClick={addUp} className="bg-blue-600 mt-4 py-3.5 rounded-xl font-extrabold uppercase text-sm w-full shadow-lg">{editId?'Update':'Add Slab ➜'}</button>
+                </div>)}
+            </div>
+            {live.length>0&&(<>
+                <div className="mb-1"><span className="text-[9px] font-extrabold text-slate-600 uppercase">Size (Gross Length — Pre-Allowance)</span></div>
+                <div className="grid grid-cols-5 gap-2 mb-5">{[{l:'All',k:null},{l:'300+',k:'o300'},{l:'250+',k:'o250'},{l:'200+',k:'o200'},{l:'<200',k:'b200'}].map(f=>(
+                    <button key={f.l} onClick={()=>setFRange(f.l)} className={"p-3 rounded-xl text-center "+(fRange===f.l?'bg-blue-600 text-white shadow-lg':'bg-slate-50 border border-slate-200 text-slate-700')}>
+                        <p className="text-[10px] font-extrabold uppercase opacity-60">{f.l}</p>
+                        <p className="text-xl font-black leading-none mt-1">{f.k?stats.cat[f.k]:live.length}</p>
+                    </button>))}</div>
+
+                <div className="bg-slate-50 border border-slate-200 shadow-xl overflow-hidden rounded-2xl mb-6">
+                    <div className="overflow-x-auto"><table className="w-full text-center text-[11px]"><thead>
+                        <tr className="bg-slate-100 text-[8px] uppercase text-slate-600">
+                            <th className="p-2 text-left">Slab</th>{showPh&&<th className="p-2">Pic</th>}<th className="p-2">Gr</th>
+                            <th className="p-2 text-orange-300">In L×Ht</th><th className="p-2 text-orange-300">SQF(In)</th>
+                            <th className="p-2 text-blue-300">CM L×Ht</th><th className="p-2 text-blue-300">SQF(CM)</th><th className="p-2 text-blue-300">Gross m²</th>
+                            <th className="p-2 text-amber-400 no-print">Margin</th><th className="p-2 text-cyan-400">CAll</th>
+                            <th className="p-2 text-purple-400 no-print">Kept</th>
+                            <th className="p-2 text-green-400">Net</th><th className="p-2 text-emerald-300">N.m²</th><th className="p-2 no-print">Act</th>
+                        </tr></thead><tbody>{filt.map(e=>(
+                        <tr key={e.id} className="border-t border-slate-200/50 hover:bg-slate-100/30">
+                            <td className="p-2 text-left font-extrabold text-blue-400 mono text-[10px]">{e.slabNo}</td>
+                            {showPh&&<td className="p-1">{e.photo?<img src={e.photo} className="thumb print-photo" onClick={()=>setZoomPh(e.photo)}/>:<span className="text-slate-700 text-[8px]">—</span>}</td>}
+                            <td className="p-2"><span className={"px-1.5 py-0.5 rounded text-[9px] font-extrabold "+(e.grade==='F'?'bg-blue-500/20 text-blue-300':e.grade==='G'?'bg-emerald-500/20 text-emerald-300':'text-slate-600')}>{e.grade||'-'}</span></td>
+                            <td className="p-2 text-orange-300/70 mono text-[10px]">{e.inL}×{e.inW}</td><td className="p-2 text-orange-300/70">{e.sqfIn}</td>
+                            <td className="p-2 text-blue-300 mono text-[10px]">{e.gL}×{e.gW}</td><td className="p-2 text-blue-300">{e.sqfCm}</td><td className="p-2 text-blue-300">{e.gSqm}</td>
+                            <td className="p-2 font-bold text-amber-400 no-print">{e.totalMargin}</td><td className="p-2 font-bold text-cyan-400">{e.custAllow}</td>
+                            <td className="p-2 font-extrabold text-purple-400 no-print">{e.retained}</td>
+                            <td className="p-2 font-bold text-green-400 mono text-[10px]">{e.nL}×{e.nW}</td><td className="p-2 font-extrabold text-emerald-300">{e.nSqm}</td>
+                            <td className="p-2 no-print"><div className="flex gap-1 justify-center">
+                                <button onClick={()=>{setEditId(e.id);setCur({inL:e.inL||'',inW:e.inW||'',gL:e.gL,gW:e.gW,grade:e.grade,photo:e.photo});setTab('manual');window.scrollTo(0,0)}} className="text-blue-400 font-bold text-[10px]">✎</button>
+                                <button onClick={()=>setEntries(p=>p.filter(x=>x.id!==e.id))} className="text-red-400/40 hover:text-red-400">✕</button>
+                            </div></td>
+                        </tr>))}</tbody></table></div></div>
+
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6 no-print">
+                    <div className="bg-orange-50 border border-orange-500/20 p-5 rounded-2xl"><p className="text-[10px] font-extrabold text-orange-400 uppercase">SQF (Inches)</p><p className="text-2xl font-black text-orange-300 mt-1">{stats.tI}</p>
+                        <p className="text-[10px] font-bold text-blue-400 mt-2">SQF (CMS): <span className="text-blue-300">{stats.tIC}</span></p>
+                        {parseFloat(stats.tI)>0&&<p className="text-[9px] text-slate-600 mt-1">Diff: {(parseFloat(stats.tIC)-parseFloat(stats.tI)).toFixed(3)}</p>}
+                    </div>
+                    <div className="bg-blue-50 border border-blue-500/20 p-5 rounded-2xl"><p className="text-[10px] font-extrabold text-blue-400 uppercase">CMS Gross m²</p><p className="text-2xl font-black text-blue-300 mt-1">{stats.gA}</p></div>
+                    <div className="bg-amber-50 border border-amber-500/20 p-5 rounded-2xl"><p className="text-[10px] font-extrabold text-amber-400 uppercase">Total Margin</p><p className="text-2xl font-black text-amber-300 mt-1">{stats.tM} <span className="text-sm opacity-50">m²</span></p></div>
+                    <div className="bg-purple-50 border border-purple-500/20 p-5 rounded-2xl"><p className="text-[10px] font-extrabold text-purple-400 uppercase">🔒 Retained</p><p className="text-2xl font-black text-purple-300 mt-1">{stats.tR} <span className="text-sm opacity-50">m²</span></p><p className="text-[10px] text-cyan-400 mt-1">Given: {stats.tC} m²</p></div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 mb-6 no-print">{['F','G'].map(g=>{const s=stats.gs[g];return s&&s.n>0?(
+                    <div key={g} className={"p-4 rounded-xl border "+(g==='F'?'bg-blue-50 border-blue-500/20':'bg-emerald-50 border-emerald-500/20')}>
+                        <div className="flex justify-between"><span className={"text-lg font-black "+(g==='F'?'text-blue-400':'text-emerald-400')}>Grade {g}</span><span className="text-slate-600 text-xs font-bold">{s.n} slabs</span></div>
+                        <div className="grid grid-cols-3 gap-2 mt-2 text-[10px]">
+                            <div><span className="text-orange-400 font-bold block">Buy</span><span className="text-slate-700 font-bold">{s.sqf} SQF</span></div>
+                            <div><span className="text-blue-400 font-bold block">Gross</span><span className="text-slate-700 font-bold">{s.gm} m²</span></div>
+                            <div><span className="text-purple-400 font-bold block">Kept</span><span className="text-slate-700 font-bold">{s.ret} m²</span></div>
+                        </div></div>):null})}</div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-5 border-t-4 border-blue-500 pt-6 pb-16">
+                    <div className="bg-gradient-to-br from-blue-600 to-blue-800 text-white p-7 rounded-2xl shadow-xl">
+                        <p className="text-[10px] font-extrabold uppercase opacity-60">Net Payable</p><p className="text-4xl font-black mt-2">{stats.nA} <span className="text-base opacity-50">m²</span></p>
+                        <div className="mt-4 pt-4 border-t border-blue-500/30 grid grid-cols-2 gap-2">
+                            <div><p className="text-[9px] font-extrabold uppercase opacity-60">SQF (Inches)</p><p className="text-lg font-black text-orange-300">{stats.tI}</p></div>
+                            <div><p className="text-[9px] font-extrabold uppercase opacity-60">SQF (CMS)</p><p className="text-lg font-black text-cyan-300">{stats.tIC}</p></div>
+                        </div></div>
+                    <div className="bg-slate-50 p-7 rounded-2xl border border-slate-200">
+                        <div className="flex justify-between border-b border-slate-200 pb-3 mb-3"><span className="text-[11px] font-extrabold text-slate-600 uppercase">Gross</span><span className="font-bold text-slate-700">{stats.gA} m²</span></div>
+                        <div className="flex justify-between items-center"><span className="text-[11px] font-extrabold text-cyan-400 uppercase">Cust Allow.</span><span className="text-4xl font-black text-cyan-400">{stats.pA}%</span></div>
+                        <p className="text-[9px] text-center mt-2 font-bold text-slate-600">{stats.tC} m² ({header.allowance}cm/side)</p>
+                        {/* LENGTH SUMMARY */}
+                        <div className="mt-4 pt-4 border-t border-slate-200">
+                            <p className="text-[9px] font-extrabold text-slate-600 uppercase mb-2">Length Summary (Gross)</p>
+                            <div className="grid grid-cols-2 gap-1 text-[10px]">
+                                <span className="text-slate-600">300+ cm:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o300}</span>
+                                <span className="text-slate-600">250-299:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o250}</span>
+                                <span className="text-slate-600">200-249:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o200}</span>
+                                <span className="text-slate-600">150-199:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o150}</span>
+                                <span className="text-slate-600">130-149:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o130}</span>
+                                <span className="text-slate-600">120-129:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o120}</span>
+                                <span className="text-slate-600">110-119:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o110}</span>
+                                <span className="text-slate-600">100-109:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o100}</span>
+                                <span className="text-slate-600">&lt;100:</span><span className="font-bold text-slate-700 text-right">{stats.cat.b100}</span>
+                                <span className="text-blue-500 font-bold border-t border-slate-300 pt-1">Total:</span><span className="font-bold text-blue-500 text-right border-t border-slate-300 pt-1">{live.length}</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div className="flex flex-col justify-end items-end pr-4"><div className="text-right">
+                        <p className="text-[11px] font-extrabold text-slate-600 uppercase mb-8">Inspector Signature</p>
+                        <div className="border-b-4 border-slate-400 w-56 mb-3"></div>
+                        <p className="font-extrabold text-lg uppercase text-blue-400">{header.supervisor||'AUTHORIZED'}</p></div></div>
+                </div>
+            </>)}
+        </div>);
+}
+const root=ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
