@@ -255,6 +255,9 @@ function ReviewTable({reviewData:rd,setReviewData:srd,onConfirm,allowance,sheetT
 /* === EXPORTS === */
 function getLenSummary(ent){const cat={o300:0,o250:0,o200:0,o150:0,o130:0,o120:0,o110:0,o100:0,b100:0};
     ent.forEach(e=>{const l=parseFloat(e.gL);if(l>=300)cat.o300++;else if(l>=250)cat.o250++;else if(l>=200)cat.o200++;else if(l>=150)cat.o150++;else if(l>=130)cat.o130++;else if(l>=120)cat.o120++;else if(l>=110)cat.o110++;else if(l>=100)cat.o100++;else cat.b100++});return cat}
+function getLenRows(ls,total){
+    const all=[{l:'300+',v:ls.o300},{l:'250-299',v:ls.o250},{l:'200-249',v:ls.o200},{l:'150-199',v:ls.o150},{l:'130-149',v:ls.o130},{l:'120-129',v:ls.o120},{l:'110-119',v:ls.o110},{l:'100-109',v:ls.o100},{l:'<100',v:ls.b100}];
+    return all.filter(c=>c.v>0).map(c=>({...c,pct:total>0?((c.v/total)*100).toFixed(1):'0'}))}
 
 function exportExcel(ent,hdr,mode){const wb=XLSX.utils.book_new();const isO=mode==='office';const rows=[];
     rows.push([isO?'KEIPL - Office Copy (CONFIDENTIAL)':'Packing List - '+(hdr.customer||'Customer')]);
@@ -276,11 +279,9 @@ function exportExcel(ent,hdr,mode){const wb=XLSX.utils.book_new();const isO=mode
         rows.push([]);const tG=ent.reduce((a,b)=>a+parseFloat(b.gSqm||0),0);const tN=ent.reduce((a,b)=>a+parseFloat(b.nSqm||0),0);
         rows.push(['','','','GROSS: '+tG.toFixed(3),'','','TOTAL:',tN.toFixed(3)]);
         /* Length Summary */
-        const ls=getLenSummary(ent);rows.push([]);rows.push(['LENGTH SUMMARY (Gross)']);
-        rows.push(['300+ cm:',ls.o300+' slabs']);rows.push(['250-299 cm:',ls.o250+' slabs']);rows.push(['200-249 cm:',ls.o200+' slabs']);
-        rows.push(['150-199 cm:',ls.o150+' slabs']);rows.push(['130-149 cm:',ls.o130+' slabs']);rows.push(['120-129 cm:',ls.o120+' slabs']);
-        rows.push(['110-119 cm:',ls.o110+' slabs']);rows.push(['100-109 cm:',ls.o100+' slabs']);rows.push(['Below 100 cm:',ls.b100+' slabs']);
-        rows.push(['Total:',ent.length+' slabs']);
+        const ls=getLenSummary(ent);const lr=getLenRows(ls,ent.length);rows.push([]);rows.push(['LENGTH SUMMARY (Gross)','','%']);
+        lr.forEach(c=>rows.push([c.l+' cm:',c.v+' slabs',c.pct+'%']));
+        rows.push(['Total:',ent.length+' slabs','100%']);
     }
     const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=Array(16).fill({wch:12});
     XLSX.utils.book_append_sheet(wb,ws,isO?'Office':'Customer');XLSX.writeFile(wb,'KEIPL_'+(isO?'Office':'Customer')+'_'+(hdr.customer||'export')+'.xlsx');}
@@ -304,12 +305,16 @@ function exportPDF(ent,hdr,mode){const{jsPDF}=window.jspdf;const doc=new jsPDF({
     if(isO){const tR=ent.reduce((a,b)=>a+parseFloat(b.retained||0),0);const tI=ent.reduce((a,b)=>a+parseFloat(b.sqfIn||0),0);const tIC=ent.reduce((a,b)=>a+parseFloat(b.sqfCm||0),0);
         doc.text('SQF(In): '+tI.toFixed(3)+' | SQF(CM): '+tIC.toFixed(3)+' | Retained: '+tR.toFixed(3)+' m²',14,fy+5)}
     /* Length Summary on both copies */
-    const ls=getLenSummary(ent);const ly=isO?fy+12:fy+8;
+    const ls=getLenSummary(ent);const lr=getLenRows(ls,ent.length);const ly=isO?fy+12:fy+8;
     doc.setFontSize(8);doc.setFont('helvetica','bold');doc.text('LENGTH SUMMARY (Gross):',14,ly);
     doc.setFont('helvetica','normal');
-    doc.text('300+: '+ls.o300+' | 250-299: '+ls.o250+' | 200-249: '+ls.o200+' | 150-199: '+ls.o150+' | 130-149: '+ls.o130,14,ly+4);
-    doc.text('120-129: '+ls.o120+' | 110-119: '+ls.o110+' | 100-109: '+ls.o100+' | <100: '+ls.b100+' | Total: '+ent.length,14,ly+8);
-    const sy=ly+18;doc.setFontSize(8);doc.setFont('helvetica','normal');doc.line(14,sy,70,sy);doc.text('Authorized Signatory',14,sy+4);doc.line(200,sy,270,sy);doc.text('Inspector',200,sy+4);
+    const lnTxt=lr.map(c=>c.l+': '+c.v+' ('+c.pct+'%)').join(' | ')+' | Total: '+ent.length;
+    /* Split into two lines if too long */
+    if(lnTxt.length>120){const mid=Math.ceil(lr.length/2);
+        doc.text(lr.slice(0,mid).map(c=>c.l+': '+c.v+' ('+c.pct+'%)').join(' | '),14,ly+4);
+        doc.text(lr.slice(mid).map(c=>c.l+': '+c.v+' ('+c.pct+'%)').join(' | ')+' | Total: '+ent.length,14,ly+8);
+    }else{doc.text(lnTxt,14,ly+4)}
+    const sy=ly+(lnTxt.length>120?18:12);doc.setFontSize(8);doc.setFont('helvetica','normal');doc.line(14,sy,70,sy);doc.text('Authorized Signatory',14,sy+4);doc.line(200,sy,270,sy);doc.text('Inspector',200,sy+4);
     const ph=ent.filter(e=>e.photo);if(ph.length>0){doc.addPage();doc.setFontSize(12);doc.setFont('helvetica','bold');doc.text('SLAB PHOTOGRAPHS',148,12,{align:'center'});
         let px=14,py=22,cW=65,rH=50;ph.forEach((e,i)=>{if(py+rH>190){doc.addPage();py=15}try{doc.addImage(e.photo,'JPEG',px,py,cW-5,rH-10);doc.setFontSize(6);doc.text(e.slabNo+' | '+e.gL+'×'+e.gW,px,py+rH-6)}catch(x){}px+=cW;if((i+1)%4===0){px=14;py+=rH}})}
     doc.save('KEIPL_'+(isO?'Office':'Customer')+'_'+(hdr.customer||'export')+'.pdf');}
@@ -317,7 +322,7 @@ function exportPDF(ent,hdr,mode){const{jsPDF}=window.jspdf;const doc=new jsPDF({
 function App(){
     const[header,setHeader]=useState(()=>{try{const s=localStorage.getItem('keipl_v101_h');if(s){return{...DH,...JSON.parse(s)}}return{...DH}}catch{return{...DH}}});
     const[entries,setEntries]=useState(()=>{try{const s=localStorage.getItem('keipl_v101_e');return s?JSON.parse(s):[]}catch{return[]}});
-    const[cur,setCur]=useState({inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});
+    const[cur,setCur]=useState({slabNo:'',inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});
     const[bulkText,setBulk]=useState('');const[editId,setEditId]=useState(null);const[fRange,setFRange]=useState('All');
     const[revData,setRevData]=useState(null);const[tab,setTab]=useState('scan');const[showExp,setShowExp]=useState(false);
     const[zoomPh,setZoomPh]=useState(null);const[showPh,setShowPh]=useState(true);
@@ -344,16 +349,25 @@ function App(){
     const sortEntries=(arr)=>arr.sort((a,b)=>{const na=parseInt(a.slabNo.replace(/\D/g,''))||0,nb=parseInt(b.slabNo.replace(/\D/g,''))||0;return na-nb});
 
     const addUp=()=>{if(!cur.gL||!cur.gW)return;
-        if(editId){setEntries(p=>sortEntries(p.map(e=>e.id===editId?{...e,inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||e.grade,photo:cur.photo||e.photo}:e)));setEditId(null)}
-        else{setEntries(p=>sortEntries([...p,{id:Date.now(),slabNo:'KEIPL/'+(p.length+1).toString().padStart(2,'0'),inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||'',photo:cur.photo}]))}
-        setCur({inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});};
+        if(editId){setEntries(p=>sortEntries(p.map(e=>e.id===editId?{...e,slabNo:cur.slabNo||e.slabNo,inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||e.grade,photo:cur.photo||e.photo}:e)));setEditId(null)}
+        else{const sn=cur.slabNo||((entries.length+1).toString());setEntries(p=>sortEntries([...p,{id:Date.now(),slabNo:'KEIPL/'+sn.replace(/^KEIPL\//i,'').padStart(2,'0'),inL:cur.inL,inW:cur.inW,gL:cur.gL,gW:cur.gW,grade:cur.grade||'',photo:cur.photo}]))}
+        setCur({slabNo:'',inL:'',inW:'',gL:'',gW:'',grade:'',photo:null});};
 
-    const doBulk=()=>{const rows=bulkText.trim().split('\n');
-        const ne=rows.map((row,i)=>{const c=row.split(/\t|,/).map(x=>x.trim());const gl=parseFloat(c[2]||c[0]);if(!gl)return null;
-            return{id:Date.now()+i,slabNo:'KEIPL/'+(entries.length+i+1).toString().padStart(2,'0'),inL:c[0]||'0',inW:c[1]||'0',gL:c[2]||c[0]||'0',gW:c[3]||c[1]||'0',grade:c[4]||'',photo:null}
+    const doBulk=()=>{const rows=bulkText.trim().split('\n').filter(r=>r.trim());
+        const ne=rows.map((row,i)=>{
+            const c=row.split(/\t|,|\|/).map(x=>x.trim()).filter(x=>x);
+            /* Detect format: 5+ cols = S.No,InL,InW,CmL,CmW[,Grade] | 4 cols = InL,InW,CmL,CmW[,Grade] */
+            let sno,inL,inW,gL,gW,grade='';
+            if(c.length>=5&&/^\d+$/.test(c[0])){
+                sno=c[0];inL=c[1];inW=c[2];gL=c[3];gW=c[4];grade=c[5]||'';
+            }else if(c.length>=4){
+                sno=(entries.length+i+1).toString();inL=c[0];inW=c[1];gL=c[2];gW=c[3];grade=c[4]||'';
+            }else return null;
+            if(!parseFloat(gL)&&!parseFloat(inL))return null;
+            return{id:Date.now()+i,slabNo:'KEIPL/'+sno.padStart(2,'0'),inL,inW,gL:gL||'0',gW:gW||'0',grade:grade.toUpperCase().replace(/[^FG]/g,''),photo:null}
         }).filter(Boolean);setEntries(p=>sortEntries([...p,...ne]));setBulk('')};
 
-    const doConfirm=(ap)=>{const ne=ap.map((it,i)=>({id:Date.now()+i,slabNo:'KEIPL/'+(entries.length+i+1).toString().padStart(2,'0'),
+    const doConfirm=(ap)=>{const ne=ap.map((it,i)=>({id:Date.now()+i,slabNo:'KEIPL/'+it.sno.toString().padStart(2,'0'),
         inL:it.l_in.toString(),inW:it.w_in.toString(),gL:it.l_cm.toString(),gW:it.w_cm.toString(),grade:it.grade,photo:null}));
         setEntries(p=>sortEntries([...p,...ne]));setRevData(null)};
 
@@ -415,24 +429,30 @@ function App(){
                 {revData&&<ReviewTable reviewData={revData} setReviewData={setRevData} onConfirm={doConfirm} allowance={header.allowance} sheetTotals={sheetTotals} scanWarn={scanWarn}/>}
 
                 {tab==='bulk'&&!revData&&(<div className="bg-slate-50 p-5 rounded-2xl border border-slate-200">
-                    <h3 className="text-xs font-extrabold uppercase text-slate-600 mb-3">Bulk — InL,InHt,CmL,CmHt[,Grade] (Grade optional)</h3>
-                    <textarea className="w-full h-28 p-3 text-xs mono border border-slate-300 rounded-xl outline-none bg-slate-100 text-slate-700 resize-none" placeholder={"67,35,180,95,F\n68,35,184,95\n43,36,0,0"} value={bulkText} onChange={e=>setBulk(e.target.value)}/>
-                    <button onClick={doBulk} className="mt-3 bg-slate-200 text-white px-8 py-2.5 rounded-xl text-[11px] font-extrabold uppercase">Import</button>
+                    <h3 className="text-xs font-extrabold uppercase text-slate-600 mb-1">Bulk Paste — from Gemini/ChatGPT/Claude</h3>
+                    <p className="text-[10px] text-slate-500 mb-3">Format: <span className="mono font-bold">S.No, InL, InHt, CmL, CmHt[, Grade]</span> — tab or comma separated</p>
+                    <textarea className="w-full h-32 p-3 text-xs mono border border-slate-300 rounded-xl outline-none bg-white text-slate-700 resize-none" placeholder={"51\t84\t32\t225\t87\n52\t85\t38\t227\t102\n53\t85\t30\t226\t86\n\nOr without S.No:\n67,35,180,95,F\n68,35,184,95"} value={bulkText} onChange={e=>setBulk(e.target.value)}/>
+                    <div className="flex items-center gap-3 mt-3">
+                        <button onClick={doBulk} className="bg-blue-600 text-white px-8 py-2.5 rounded-xl text-[11px] font-extrabold uppercase">Import {bulkText.trim().split('\n').filter(r=>r.trim()).length} rows</button>
+                        <span className="text-[9px] text-slate-500">S.No → KEIPL/51, KEIPL/52...</span>
+                    </div>
                 </div>)}
 
-                {tab==='manual'&&!revData&&(<div className="bg-slate-50 text-white p-5 rounded-2xl border border-slate-200 max-w-lg">
-                    <h3 className="text-xs font-extrabold text-blue-400 uppercase mb-4">Manual — Slab {entries.length+1}</h3>
+                {tab==='manual'&&!revData&&(<div className="bg-slate-50 p-5 rounded-2xl border border-slate-200 max-w-lg">
+                    <h3 className="text-xs font-extrabold text-blue-600 uppercase mb-4">{editId?'Edit Slab':'Manual Entry'}</h3>
                     <div className="space-y-3">
-                        <p className="text-[9px] font-extrabold text-orange-400 uppercase">Buying (Inches)</p>
+                        <div><p className="text-[9px] font-extrabold text-slate-500 uppercase mb-1">Slab Number</p>
+                            <input type="text" placeholder={"e.g. 51 → KEIPL/51"} className="p-3 rounded-lg bg-white border border-slate-300 font-bold mono outline-none text-slate-700 w-full" value={cur.slabNo} onChange={e=>setCur({...cur,slabNo:e.target.value})}/></div>
+                        <p className="text-[9px] font-extrabold text-orange-500 uppercase">Buying (Inches)</p>
                         <div className="grid grid-cols-2 gap-2">
-                            <input type="number" placeholder="Length (in)" className="p-3 rounded-lg bg-slate-100 border border-orange-500/30 font-bold mono outline-none text-orange-200" value={cur.inL} onChange={e=>setCur({...cur,inL:e.target.value})}/>
-                            <input type="number" placeholder="Height (in)" className="p-3 rounded-lg bg-slate-100 border border-orange-500/30 font-bold mono outline-none text-orange-200" value={cur.inW} onChange={e=>setCur({...cur,inW:e.target.value})}/>
+                            <input type="number" placeholder="Length (in)" className="p-3 rounded-lg bg-white border border-orange-300 font-bold mono outline-none text-orange-700" value={cur.inL} onChange={e=>setCur({...cur,inL:e.target.value})}/>
+                            <input type="number" placeholder="Height (in)" className="p-3 rounded-lg bg-white border border-orange-300 font-bold mono outline-none text-orange-700" value={cur.inW} onChange={e=>setCur({...cur,inW:e.target.value})}/>
                         </div>
-                        <p className="text-[9px] font-extrabold text-blue-400 uppercase">Selling (CMS)</p>
+                        <p className="text-[9px] font-extrabold text-blue-500 uppercase">Selling (CMS)</p>
                         <div className="grid grid-cols-3 gap-2">
-                            <input type="number" placeholder="Length (cm)" className="p-3 rounded-lg bg-slate-100 border border-blue-500/30 font-bold mono outline-none text-blue-200" value={cur.gL} onChange={e=>setCur({...cur,gL:e.target.value})}/>
-                            <input type="number" placeholder="Height (cm)" className="p-3 rounded-lg bg-slate-100 border border-blue-500/30 font-bold mono outline-none text-blue-200" value={cur.gW} onChange={e=>setCur({...cur,gW:e.target.value})}/>
-                            <select value={cur.grade||''} onChange={e=>setCur({...cur,grade:e.target.value})} className="p-3 rounded-lg bg-slate-100 border border-slate-300 font-bold outline-none"><option value="">Gr</option><option value="F">F</option><option value="G">G</option></select>
+                            <input type="number" placeholder="Length (cm)" className="p-3 rounded-lg bg-white border border-blue-300 font-bold mono outline-none text-blue-700" value={cur.gL} onChange={e=>setCur({...cur,gL:e.target.value})}/>
+                            <input type="number" placeholder="Height (cm)" className="p-3 rounded-lg bg-white border border-blue-300 font-bold mono outline-none text-blue-700" value={cur.gW} onChange={e=>setCur({...cur,gW:e.target.value})}/>
+                            <select value={cur.grade||''} onChange={e=>setCur({...cur,grade:e.target.value})} className="p-3 rounded-lg bg-white border border-slate-300 font-bold outline-none text-slate-700"><option value="">Gr</option><option value="F">F</option><option value="G">G</option></select>
                         </div>
                         <div className="flex items-center gap-2"><input type="file" accept="image/*" capture="environment" className="hidden" id="slab-ph" onChange={e=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onloadend=()=>setCur(p=>({...p,photo:r.result}));r.readAsDataURL(f)}}/>
                             <label htmlFor="slab-ph" className="cursor-pointer bg-slate-200 hover:bg-slate-300 p-3 rounded-lg flex-1 text-center text-[10px] font-bold uppercase">{cur.photo?"✅ Photo":"📷 Slab Photo"}</label>
@@ -461,7 +481,7 @@ function App(){
                             <th className="p-2 text-green-400">Net</th><th className="p-2 text-emerald-300">N.m²</th><th className="p-2 no-print">Act</th>
                         </tr></thead><tbody>{filt.map(e=>(
                         <tr key={e.id} className="border-t border-slate-200/50 hover:bg-slate-100/30">
-                            <td className="p-2 text-left font-extrabold text-blue-400 mono text-[10px]">{e.slabNo}</td>
+                            <td className="p-1 text-left"><input type="text" value={e.slabNo} onChange={ev=>setEntries(p=>p.map(x=>x.id===e.id?{...x,slabNo:ev.target.value}:x))} className="w-24 font-extrabold text-blue-600 mono text-[10px] bg-transparent border-b border-transparent hover:border-blue-300 focus:border-blue-500 outline-none p-1"/></td>
                             {showPh&&<td className="p-1">{e.photo?<img src={e.photo} className="thumb print-photo" onClick={()=>setZoomPh(e.photo)}/>:<span className="text-slate-700 text-[8px]">—</span>}</td>}
                             <td className="p-2"><span className={"px-1.5 py-0.5 rounded text-[9px] font-extrabold "+(e.grade==='F'?'bg-blue-500/20 text-blue-300':e.grade==='G'?'bg-emerald-500/20 text-emerald-300':'text-slate-600')}>{e.grade||'-'}</span></td>
                             <td className="p-2 text-orange-300/70 mono text-[10px]">{e.inL}×{e.inW}</td><td className="p-2 text-orange-300/70">{e.sqfIn}</td>
@@ -470,7 +490,7 @@ function App(){
                             <td className="p-2 font-extrabold text-purple-400 no-print">{e.retained}</td>
                             <td className="p-2 font-bold text-green-400 mono text-[10px]">{e.nL}×{e.nW}</td><td className="p-2 font-extrabold text-emerald-300">{e.nSqm}</td>
                             <td className="p-2 no-print"><div className="flex gap-1 justify-center">
-                                <button onClick={()=>{setEditId(e.id);setCur({inL:e.inL||'',inW:e.inW||'',gL:e.gL,gW:e.gW,grade:e.grade,photo:e.photo});setTab('manual');window.scrollTo(0,0)}} className="text-blue-400 font-bold text-[10px]">✎</button>
+                                <button onClick={()=>{setEditId(e.id);setCur({slabNo:e.slabNo,inL:e.inL||'',inW:e.inW||'',gL:e.gL,gW:e.gW,grade:e.grade,photo:e.photo});setTab('manual');window.scrollTo(0,0)}} className="text-blue-500 font-bold text-[10px]">✎</button>
                                 <button onClick={()=>setEntries(p=>p.filter(x=>x.id!==e.id))} className="text-red-400/40 hover:text-red-400">✕</button>
                             </div></td>
                         </tr>))}</tbody></table></div></div>
@@ -508,17 +528,21 @@ function App(){
                         {/* LENGTH SUMMARY */}
                         <div className="mt-4 pt-4 border-t border-slate-200">
                             <p className="text-[9px] font-extrabold text-slate-600 uppercase mb-2">Length Summary (Gross)</p>
-                            <div className="grid grid-cols-2 gap-1 text-[10px]">
-                                <span className="text-slate-600">300+ cm:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o300}</span>
-                                <span className="text-slate-600">250-299:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o250}</span>
-                                <span className="text-slate-600">200-249:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o200}</span>
-                                <span className="text-slate-600">150-199:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o150}</span>
-                                <span className="text-slate-600">130-149:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o130}</span>
-                                <span className="text-slate-600">120-129:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o120}</span>
-                                <span className="text-slate-600">110-119:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o110}</span>
-                                <span className="text-slate-600">100-109:</span><span className="font-bold text-slate-700 text-right">{stats.cat.o100}</span>
-                                <span className="text-slate-600">&lt;100:</span><span className="font-bold text-slate-700 text-right">{stats.cat.b100}</span>
-                                <span className="text-blue-500 font-bold border-t border-slate-300 pt-1">Total:</span><span className="font-bold text-blue-500 text-right border-t border-slate-300 pt-1">{live.length}</span>
+                            <div className="space-y-1 text-[10px]">
+                                {[{l:'300+',k:'o300'},{l:'250-299',k:'o250'},{l:'200-249',k:'o200'},{l:'150-199',k:'o150'},{l:'130-149',k:'o130'},{l:'120-129',k:'o120'},{l:'110-119',k:'o110'},{l:'100-109',k:'o100'},{l:'<100',k:'b100'}]
+                                .filter(c=>stats.cat[c.k]>0).map(c=>{const pct=live.length>0?((stats.cat[c.k]/live.length)*100).toFixed(1):0;return(
+                                    <div key={c.k} className="flex items-center gap-2">
+                                        <span className="text-slate-500 w-16 text-right">{c.l}</span>
+                                        <div className="flex-1 bg-slate-200 rounded-full h-3 overflow-hidden"><div className="bg-blue-500 h-full rounded-full" style={{width:pct+'%'}}/></div>
+                                        <span className="font-bold text-slate-700 w-8 text-right">{stats.cat[c.k]}</span>
+                                        <span className="text-blue-500 font-bold w-12 text-right">{pct}%</span>
+                                    </div>)})}
+                                <div className="flex items-center gap-2 border-t border-slate-300 pt-1 mt-1">
+                                    <span className="text-blue-600 font-bold w-16 text-right">Total</span>
+                                    <div className="flex-1"></div>
+                                    <span className="font-bold text-blue-600 w-8 text-right">{live.length}</span>
+                                    <span className="text-blue-600 font-bold w-12 text-right">100%</span>
+                                </div>
                             </div>
                         </div>
                     </div>
